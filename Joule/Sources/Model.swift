@@ -83,6 +83,18 @@ final class Model: ObservableObject {
         if visible { tick() }
     }
 
+    /// Swaps in a sample scene and forgets everything measured so far.
+    func stage(_ s: Demo.Scene) {
+        ephemeral = true
+        adjust = { Demo.fill(&$0, s) }
+        queue.sync {}
+        DispatchQueue.main.async { [self] in
+            lastTick = nil; now = Reading(); smooth = Reading(); bucket = []; status = .unknown
+            history = Demo.history(s); apps = Demo.apps; appMinutes = 60; mode = s.mode
+            tick()
+        }
+    }
+
     func tick() {
         let wantApps = Date().timeIntervalSince(lastApps) >= (visible ? 3 : 30)
         if wantApps { lastApps = Date() }
@@ -91,10 +103,10 @@ final class Model: ObservableObject {
             guard var r = sensors.read() else { return }
             adjust?(&r)
             let reading = r
-            let a = wantApps ? meter.sample() : nil
+            let a = wantApps && adjust == nil ? meter.sample() : nil
             let mins = Int(meter.covered / 60)
             DispatchQueue.main.async {
-                if wantApps { self.appMinutes = mins }
+                if wantApps, self.adjust == nil { self.appMinutes = mins }
                 self.apply(reading, a)
             }
         }
@@ -282,6 +294,7 @@ final class Model: ObservableObject {
         }
     }
     func readMode() {
+        guard adjust == nil else { return }
         Model.run("/usr/bin/pmset", ["-g"]) { out, _ in
             for l in out.split(separator: "\n") {
                 let p = l.split(separator: " ")

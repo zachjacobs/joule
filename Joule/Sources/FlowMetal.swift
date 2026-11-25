@@ -311,6 +311,7 @@ struct Stage: View {
     @Environment(\.accessibilityReduceMotion) private var still
     @Environment(\.colorScheme) private var scheme
     static var snapshot = false
+    static var frozen = false      // Lets a recording step time itself.
 
     var body: some View {
         Group {
@@ -322,7 +323,8 @@ struct Stage: View {
     }
     private func frame() -> CGImage? {
         renderer.dark = scheme == .dark
-        update(); renderer.advance(1); renderer.advance(0.1)
+        update()
+        if !Stage.frozen { renderer.advance(nil); renderer.advance(0.1) }
         return renderer.image(size)
     }
 

@@ -132,25 +132,33 @@ struct Estimates: View {
                 tile(m.now.plugged && m.status != .draining ? "If unplugged" : "Until empty", empty.0, empty.1)
                 tile("Net rate", m.ready ? signed(m.sustained) : "–", rate)
             }
-            if !options.isEmpty && m.now.percent < 95 {
-                Divider().opacity(0.6)
-                HStack(spacing: 0) {
-                    Text(m.now.plugged ? "Full with a\nbigger charger" : "Full if you\nplug in").font(.system(size: 11)).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    ForEach(options, id: \.self) { w in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(Int(w)) W").font(.system(size: 11)).foregroundStyle(.secondary)
-                            Text(m.ready ? m.withCharger(w).map(soft) ?? "Not enough" : "–").font(.system(size: 12, weight: .medium)).monospacedDigit()
-                        }.frame(maxWidth: .infinity, alignment: .leading)
-                    }
+            Divider().opacity(0.6)
+            HStack(spacing: 0) {
+                if !options.isEmpty && m.now.percent < 95 {
+                    caption(m.now.plugged ? "Full with a\nbigger charger" : "Full if you\nplug in")
+                    ForEach(options, id: \.self) { w in cell("\(Int(w)) W", m.ready ? m.withCharger(w).map(soft) ?? "Not enough" : "–") }
+                } else {
+                    caption("Unplugged\nwould last")
+                    ForEach([6.0, 12, 30], id: \.self) { w in cell("at \(Int(w)) W", m.now.remainingWh > 0 ? soft(m.now.remainingWh / w) : "–") }
                 }
             }
         }
     }
+    private func caption(_ t: String) -> some View {
+        Text(t).font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private func cell(_ t: String, _ v: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(t).font(.system(size: 11)).foregroundStyle(.secondary)
+            Text(v).font(.system(size: 12, weight: .medium)).monospacedDigit()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
     private var full: (String, String) {
         guard m.ready else { return ("–", " ") }
         switch m.status {
-        case .full: return ("Full", "running on the charger")
+        case .full: return ("Full", "on the charger")
         case .battery: return ("–", "not plugged in")
         case .draining: return ("–", "losing charge")
         case .held: return ("–", "holding level")
@@ -194,7 +202,7 @@ enum Icons {
     private static var cache: [String: NSImage] = [:]
     static func get(_ p: String) -> NSImage {
         if let i = cache[p] { return i }
-        let i = NSWorkspace.shared.icon(forFile: p)
+        let i = NSWorkspace.shared.icon(forFile: URL(fileURLWithPath: p).resolvingSymlinksInPath().path)   // Safari is a link; don't badge it as one.
         cache[p] = i
         return i
     }

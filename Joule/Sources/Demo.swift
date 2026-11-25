@@ -2,19 +2,82 @@ import Foundation
 
 /// Made-up data and checks, used only by the development flags.
 enum Demo {
-    /// A day with charging, draining, a sleep gap and a stretch on battery.
-    static func history() -> [Point] {
+    /// Sample machines for screenshots, so none of them show the developer's own Mac.
+    struct Scene {
+        var percent: Double, input: Double, system: Double, display: Double, processor: Double
+        var adapter = 0.0, volts = 0.0, profiles: [Profile] = []
+        var mode = 0, wobble = 3.0, past = Past.charger
+        var full = false
+        enum Past { case charger, busy, unplugged, day }
+        var battery: Double { input - system }
+        var plugged: Bool { adapter > 0 }
+    }
+    private static let big = [Profile(volts: 5, amps: 3), Profile(volts: 9, amps: 3), Profile(volts: 15, amps: 3), Profile(volts: 20, amps: 3.5)]
+    static let scenes: [String: Scene] = [
+        "charging": Scene(percent: 42, input: 64.2, system: 15.8, display: 5.4, processor: 5.9, adapter: 70, volts: 20, profiles: big),
+        "draining": Scene(percent: 18, input: 25.8, system: 37.4, display: 7.6, processor: 18.2, adapter: 27, volts: 9, profiles: Array(big.prefix(2)), wobble: 4, past: .busy),
+        "battery": Scene(percent: 64, input: 0, system: 9.8, display: 3.9, processor: 2.8, mode: 1, wobble: 1.5, past: .unplugged),
+        "full": Scene(percent: 100, input: 17.4, system: 17.4, display: 6.1, processor: 6.4, adapter: 96, volts: 20, profiles: big, mode: 2, past: .day, full: true),
+    ]
+
+    static func fill(_ r: inout Reading, _ s: Scene) {
+        r.percent = s.percent; r.plugged = s.plugged; r.charging = s.battery > 0.5; r.full = s.full
+        r.input = s.input; r.system = s.system; r.battery = s.battery
+        r.display = s.display; r.processor = s.processor
+        r.wall = s.plugged ? s.input * 1.045 : 0
+        r.adapterWatts = s.adapter; r.profiles = s.profiles
+        r.contract = s.plugged ? Profile(volts: s.volts, amps: (s.adapter / s.volts * 10).rounded() / 10) : nil
+        r.inVolts = s.plugged ? s.volts * 0.985 : 0; r.inAmps = s.plugged ? s.input / r.inVolts : 0
+        r.fullCap = 5960; r.nominal = 6010; r.design = 6249; r.cycles = 112; r.ratedCycles = 1000
+        r.remaining = r.fullCap * s.percent / 100
+        r.volts = 10.9 + s.percent / 100 * 1.7; r.amps = s.battery / r.volts
+        r.temperature = 31
+    }
+
+    static let apps: [AppUsage] = [
+        AppUsage(name: "Safari", icon: "/Applications/Safari.app", symbol: "safari", watts: 0.62, hour: 0.74),
+        AppUsage(name: "macOS", icon: nil, symbol: "apple.logo", watts: 0.31, hour: 0.38),
+        AppUsage(name: "Music", icon: "/System/Applications/Music.app", symbol: "app", watts: 0.16, hour: 0.14),
+        AppUsage(name: "Messages", icon: "/System/Applications/Messages.app", symbol: "app", watts: 0.021, hour: 0.062),
+        AppUsage(name: "Notes", icon: "/System/Applications/Notes.app", symbol: "app", watts: 0.004, hour: 0.035),
+    ]
+
+    /// Power history that ends at the scene's present values, with the level worked out backwards from them.
+    static func history(_ s: Scene) -> [Point] {
         let now = Date().timeIntervalSince1970
-        var out: [Point] = [], pct = 78.0, t = now - 86400
+        var out: [Point] = []
+        var t = now - 86400, seed = UInt64(7)
+        func random() -> Double { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Double(seed >> 33) / Double(1 << 31) * 2 - 1 }
         while t < now {
-            let age = (now - t) / 60, wobble = sin(t / 190) * 5 + sin(t / 61) * 4 + Double.random(in: -5...5)
-            if !(age > 420 && age < 840), !(age > 26 && age < 33) {
-                let plugged = !(age > 8 && age < 20) && !(age > 150 && age < 260) && !(age > 1000 && age < 1150)
-                let load = max(7, (age > 60 && age < 100 ? 32 : 22) + wobble), input = plugged ? 25.8 : 0
-                pct = min(100, max(4, pct + (input - load) * 20 / 3600 / 61 * 100))
-                out.append(Point(t: t, input: input, system: load, battery: input - load, pct: pct, plugged: plugged))
+            let age = (now - t) / 60
+            let wave = (sin(age / 3.1) * 0.7 + sin(age / 1.3) * 0.4 + random() * 0.4) * s.wobble * min(1, age / 5)
+            var plugged = s.plugged, input = s.input, load = s.system, skip = false
+            switch s.past {
+            case .charger:
+                if age > 16, age < 34 { plugged = false }
+                if age >= 34 { load = 24; input = 64.2 }
+            case .busy:
+                if age > 24 { load = 21 }
+                if age > 12, age <= 24 { load = 29 }
+                if age > 44, age < 49 { skip = true }
+            case .unplugged:
+                if age > 26 { plugged = true; input = 25.8; load = 17 }
+            case .day:
+                if age > 470, age < 920 { skip = true }
+                if age > 150, age < 420 { plugged = false; load = 10 }
+                if age > 920, age < 1180 { plugged = false; load = 9 }
+                if age > 60, age <= 150 { input = 58 }
+                if age <= 60 || (age >= 420 && age <= 470) || age >= 1180 { input = load }
             }
+            let system = max(4, load + (s.full && input == load ? 0 : wave))
+            if !skip { out.append(Point(t: t, input: plugged ? input : 0, system: system, battery: (plugged ? input : 0) - system, pct: 0, plugged: plugged)) }
             t += 20
+        }
+        var pct = s.percent
+        for i in out.indices.reversed() {
+            out[i].pct = min(100, max(3, pct))
+            pct -= out[i].battery * 20 / 3600 / 68.8 * 100
+            if s.full && pct > 100 { pct = 100 }
         }
         return out
     }

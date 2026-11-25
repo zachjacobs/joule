@@ -137,39 +137,71 @@ final class Delegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         exit(0)
     }
 
-    /// Development aid: render the live panel to a PNG and exit.
+    /// Development aid: render the panel to a PNG and exit.
     private func snapshot(_ path: String, dark: Bool) {
+        let args = CommandLine.arguments
         model.ephemeral = true
-        if CommandLine.arguments.contains("--demo-history") { model.history = Demo.history() }
-        if CommandLine.arguments.contains("--24h") { HistoryUI.start.hours = 24 }
-        if CommandLine.arguments.contains("--level") { HistoryUI.start.level = true }
-        if CommandLine.arguments.contains("--demo-battery") {
-            model.adjust = { r in r.plugged = false; r.charging = false; r.input = 0; r.wall = 0; r.battery = -r.system; r.percent = 64; r.remaining = r.fullCap * 0.64 }
-        }
-        if CommandLine.arguments.contains("--demo-charge") {
-            model.adjust = { r in r.input = 25.8; r.system = 13; r.battery = 12.8; r.display = 7; r.processor = 3 }
-        }
-        if CommandLine.arguments.contains("--demo-drain") {
-            model.adjust = { r in r.input = 25.8; r.system = 37.6; r.battery = -11.8; r.display = 7; r.processor = 18 }
-        }
+        if let i = args.firstIndex(of: "--scene"), args.count > i + 1, let s = Demo.scenes[args[i + 1]] { model.stage(s) }
+        if args.contains("--24h") { HistoryUI.start.hours = 24 }
+        if args.contains("--level") { HistoryUI.start.level = true }
         Stage.snapshot = true
-        let root = Panel(m: model, notifier: notifier).background(Color(nsColor: .windowBackgroundColor))
+        let flowOnly = args.contains("--flow")
+        let shape = RoundedRectangle(cornerRadius: 26, style: .continuous)
+        let root = Group {
+            if flowOnly { Flow(m: model).frame(width: 390).padding(14) } else { Panel(m: model, notifier: notifier) }
+        }
+        .background(Color(nsColor: .windowBackgroundColor), in: shape)
+        .overlay(shape.strokeBorder(.primary.opacity(0.12), lineWidth: 1))
+        .environment(\.controlActiveState, .key)
+        .padding(1)
         let v = NSHostingView(rootView: root)
         v.frame = NSRect(origin: .zero, size: v.fittingSize)
         let w = NSWindow(contentRect: v.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         w.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        w.isOpaque = false; w.backgroundColor = .clear
         w.contentView = v
         w.setFrameOrigin(NSPoint(x: -5000, y: -5000))
         w.orderFrontRegardless()
         window = w
         model.visible = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 48) {
+        func grab() -> NSBitmapImageRep {
             let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
             v.cacheDisplay(in: v.bounds, to: rep)
-            try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
-            print(v.bounds.size, self.model.now)
+            return rep
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 28) { [self] in
+            if flowOnly { record(path, grab) }
+            else { try? grab().representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path)) }
             exit(0)
         }
+    }
+
+    /// An animated PNG of the flow card. The last frames fade into the first so it loops cleanly.
+    private func record(_ path: String, _ grab: () -> NSBitmapImageRep) {
+        let fps = 16.0, loop = 48, fade = 10
+        Stage.frozen = true
+        var shots: [CGImage] = []
+        for _ in 0..<(loop + fade) {
+            FlowRenderer.shared.advance(1 / fps)
+            model.objectWillChange.send()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.03))
+            if let i = grab().cgImage { shots.append(i) }
+        }
+        guard shots.count == loop + fade, let out = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, loop, nil) else { return }
+        CGImageDestinationSetProperties(out, [kCGImagePropertyPNGDictionary: [kCGImagePropertyAPNGLoopCount: 0]] as CFDictionary)
+        let W = shots[0].width * 5 / 8, H = shots[0].height * 5 / 8, rect = CGRect(x: 0, y: 0, width: W, height: H)
+        for n in 0..<loop {
+            let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            ctx.interpolationQuality = .high
+            ctx.draw(shots[n + fade], in: rect)
+            if n >= loop - fade {
+                // Ease into the frames that lead up to the first one.
+                ctx.setAlpha(CGFloat(n - (loop - fade) + 1) / CGFloat(fade))
+                ctx.draw(shots[n - (loop - fade)], in: rect)
+            }
+            CGImageDestinationAddImage(out, ctx.makeImage()!, [kCGImagePropertyPNGDictionary: [kCGImagePropertyAPNGDelayTime: 1 / fps]] as CFDictionary)
+        }
+        CGImageDestinationFinalize(out)
     }
 }
 

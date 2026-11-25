@@ -1,0 +1,44 @@
+# Push a tag like v1.2.3 to publish a download.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Tag must look like v1.2.3"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Build
+        run: BUILD="$GITHUB_RUN_NUMBER" Joule/build.sh
+      - name: Test
+        run: Joule/Joule.app/Contents/MacOS/Joule --selftest
+      - name: Package
+        run: |
+          codesign --verify --strict Joule/Joule.app
+          ditto -c -k --keepParent Joule/Joule.app "Joule-$VERSION.zip"
+          shasum -a 256 "Joule-$VERSION.zip" > "Joule-$VERSION.zip.sha256"
+          cat "Joule-$VERSION.zip.sha256"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          Download \`Joule-$VERSION.zip\`, unzip it, and move Joule to Applications.
+
+          Joule isn't notarized by Apple, so macOS blocks it the first time. Open it once, then go to **System Settings → Privacy & Security** and choose **Open Anyway**.
+
+          Needs a Mac with Apple silicon and macOS 15 or later.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" "Joule-$VERSION.zip" "Joule-$VERSION.zip.sha256" \
+            --title "Joule $VERSION" --notes-file notes.md --generate-notes --verify-tag

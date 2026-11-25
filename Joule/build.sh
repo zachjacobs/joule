@@ -1,6 +1,9 @@
 #!/bin/zsh
 # Builds Joule.app next to this script. Needs only the Xcode command line tools.
+# VERSION and BUILD set the numbers shown in Finder.
 set -e
+VERSION=${VERSION:-0.0.0}
+BUILD=${BUILD:-1}
 cd "${0:a:h}"
 A=Joule.app/Contents
 rm -rf Joule.app; mkdir -p $A/MacOS $A/Resources
@@ -13,8 +16,8 @@ cat > $A/Info.plist <<P
 <key>CFBundleExecutable</key><string>Joule</string>
 <key>CFBundleIdentifier</key><string>local.joule.battery</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.0</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>$VERSION</string>
+<key>CFBundleVersion</key><string>$BUILD</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>CFBundleIconFile</key><string>Joule</string>
 <key>LSUIElement</key><true/>
@@ -28,4 +31,4 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns $T/J.iconset -o $A/Resources/Joule.icns; rm -rf $T
 codesign --force -s - Joule.app
-echo "Built Joule.app"
+echo "Built Joule.app $VERSION ($BUILD)"
