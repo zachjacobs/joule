@@ -30,5 +30,6 @@ for s in 16 32 128 256 512; do
   sips -z $((s*2)) $((s*2)) $T/i.png --out $T/J.iconset/icon_${s}x$s@2x.png >/dev/null
 done
 iconutil -c icns $T/J.iconset -o $A/Resources/Joule.icns; rm -rf $T
+cp ../LICENSE $A/Resources/LICENSE.txt
 codesign --force -s - Joule.app
 echo "Built Joule.app $VERSION ($BUILD)"

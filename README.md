@@ -89,3 +89,7 @@ Push a version tag. GitHub Actions builds, tests and publishes the download.
 ```bash
 git tag v1.2.3 && git push origin v1.2.3
 ```
+
+## License
+
+[MIT](LICENSE). Use it, change it and share it, including commercially, as long as you keep the license notice.
