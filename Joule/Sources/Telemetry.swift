@@ -162,22 +162,51 @@ enum Estimate {
     }
 }
 
-struct AppUsage: Identifiable { var id: String; var name: String; var path: String?; var watts: Double }
+struct AppUsage: Identifiable {
+    var id: String { name }
+    var name: String
+    var icon: String?      // path to an app bundle
+    var symbol: String     // used when there is no bundle
+    var watts = 0.0        // since the last sample
+    var hour = 0.0         // average over the last hour
+}
 
-/// Measures per-app processor energy from the kernel's own counters.
+/// Measures per-app processor energy from the kernel's own counters, and keeps an hour of it.
 final class AppMeter {
     private var last: [pid_t: (start: UInt64, nj: UInt64)] = [:]
-    private var lastTime: UInt64 = 0
+    private var lastTime: UInt64 = 0, lastAbs: UInt64 = 0
+    private var minutes: [(minute: UInt64, seconds: Double, joules: [String: Double])] = []
+    private var known: [String: AppUsage] = [:]
+    /// Seconds of measurement behind the hourly averages.
+    var covered: Double { minutes.reduce(0) { $0 + $1.seconds } }
+
+    /// Turns an executable path into something a person would recognise.
+    static func identify(_ path: String) -> AppUsage {
+        func has(_ p: String) -> Bool { path.hasPrefix(p) }
+        if path.contains("com.apple.WebKit") { return AppUsage(name: "Safari and web views", icon: "/Applications/Safari.app", symbol: "safari") }
+        if path.contains("/System/Applications/") || !has("/System/"), let e = path.range(of: ".app/") {
+            let app = String(path[..<e.lowerBound]) + ".app"
+            return AppUsage(name: ((app as NSString).lastPathComponent as NSString).deletingPathExtension, icon: app, symbol: "app")
+        }
+        if has("/System/") || has("/usr/libexec/") || has("/usr/sbin/") || has("/sbin/") || has("/Library/Apple/") {
+            return AppUsage(name: "macOS", icon: nil, symbol: "apple.logo")
+        }
+        if has("/usr/") || has("/bin/") || has("/opt/") || has("/Library/Developer/") {
+            return AppUsage(name: "Command line tools", icon: nil, symbol: "terminal.fill")
+        }
+        return AppUsage(name: (path as NSString).lastPathComponent, icon: nil, symbol: "gearshape.fill")
+    }
 
     func sample() -> [AppUsage] {
-        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), abs = mach_absolute_time()
         let dt = Double(now - lastTime) / 1e9
-        let fresh = lastTime == 0 || dt > 30
-        lastTime = now
+        let fresh = lastTime == 0 || dt > 300
+        let since = lastAbs
+        lastTime = now; lastAbs = abs
         var pids = [pid_t](repeating: 0, count: 4096)
         let n = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
         var next: [pid_t: (start: UInt64, nj: UInt64)] = [:]
-        var sums: [String: AppUsage] = [:]
+        var joules: [String: Double] = [:]
         for pid in pids.prefix(max(0, n)) where pid > 0 {
             var ri = rusage_info_v6()
             let rc = withUnsafeMutablePointer(to: &ri) {
@@ -185,22 +214,34 @@ final class AppMeter {
             }
             guard rc == 0 else { continue }
             next[pid] = (ri.ri_proc_start_abstime, ri.ri_energy_nj)
-            guard !fresh, let p = last[pid], p.start == ri.ri_proc_start_abstime, ri.ri_energy_nj > p.nj else { continue }
-            let w = Double(ri.ri_energy_nj - p.nj) / 1e9 / dt
+            guard !fresh else { continue }
+            let before: UInt64
+            if let p = last[pid], p.start == ri.ri_proc_start_abstime { before = p.nj }
+            else if ri.ri_proc_start_abstime >= since { before = 0 }   // Started since the last sample.
+            else { continue }
+            guard ri.ri_energy_nj > before else { continue }
             var buf = [CChar](repeating: 0, count: 4096)
             guard proc_pidpath(pid, &buf, 4096) > 0 else { continue }
-            let path = String(cString: buf)
-            var name = (path as NSString).lastPathComponent, icon: String?
-            if let e = path.range(of: ".app/") {
-                let key = String(path[..<e.lowerBound]) + ".app"
-                name = ((key as NSString).lastPathComponent as NSString).deletingPathExtension
-                icon = key
-            }
-            // Grouped by name: helpers often run from outside their app bundle.
-            sums[name, default: AppUsage(id: name, name: name, path: icon, watts: 0)].watts += w
-            if sums[name]?.path == nil { sums[name]?.path = icon }
+            let who = AppMeter.identify(String(cString: buf))
+            // Helpers often run from outside their app bundle, so group by name and keep any icon found.
+            if known[who.name]?.icon == nil { known[who.name] = who }
+            joules[who.name, default: 0] += Double(ri.ri_energy_nj - before) / 1e9
         }
         last = next
-        return sums.values.sorted { $0.watts > $1.watts }
+        guard !fresh, dt > 0 else { return [] }
+        let minute = now / 60_000_000_000
+        if minutes.last?.minute != minute { minutes.append((minute, 0, [:])) }
+        minutes[minutes.count - 1].seconds += dt
+        for (k, j) in joules { minutes[minutes.count - 1].joules[k, default: 0] += j }
+        minutes.removeAll { $0.minute + 60 <= minute }
+        let total = max(1, covered)
+        var hour: [String: Double] = [:]
+        for m in minutes { for (k, j) in m.joules { hour[k, default: 0] += j } }
+        return hour.compactMap { name, j in
+            guard var u = known[name] else { return nil }
+            u.watts = (joules[name] ?? 0) / dt
+            u.hour = j / total
+            return u
+        }.sorted { $0.hour > $1.hour }
     }
 }

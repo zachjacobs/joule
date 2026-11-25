@@ -114,78 +114,98 @@ fragment float4 fs(V in [[stage_in]], constant U &u [[buffer(0)]]) {
     o = o + r * (1 - o.a);
     return o;
 }
+
+struct G {
+    float2 size; float scale; float dark;
+    float level, pad0, pad1, pad2;
+    float4 color;
+};
+static float rbox(float2 p, float2 lo, float2 hi, float r) {
+    float2 c = (lo + hi) * 0.5, h = (hi - lo) * 0.5;
+    r = min(r, min(h.x, h.y));
+    float2 q = abs(p - c) - h + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+static float4 over(float4 a, float4 b) { return a + b * (1 - a.a); }
+// The battery level. Deliberately still: the power flow below is the one thing that moves.
+fragment float4 gauge(V in [[stage_in]], constant G &u [[buffer(0)]]) {
+    // Drawn lying down, then stood on end: x runs from the bottom of the view to the top.
+    float2 q = in.pos.xy / u.scale, size = u.size.yx;
+    float2 p = float2(size.x - q.y, q.x);
+    bool dark = u.dark > 0.5;
+    float aa = 0.5 / u.scale, m = 10;
+    float2 lo = float2(4, m), hi = float2(size.x - 8, size.y - m);
+    float3 col = u.color.rgb;
+    float shell = rbox(p, lo, hi, 7);
+    float inShell = 1 - smoothstep(-aa, aa, shell);
+    float nub = rbox(p, float2(hi.x + 1.5, size.y * 0.5 - 5), float2(hi.x + 5, size.y * 0.5 + 5), 2);
+    float pad = 2.5, span = hi.x - lo.x - pad * 2;
+    float2 fl = lo + pad, fh = float2(fl.x + max(6.0, span * u.level), hi.y - pad);
+    float fd = rbox(p, fl, fh, 4.5);
+    float inFill = 1 - smoothstep(-aa, aa, fd);
+    float t = saturate((p.x - fl.x) / max(1.0, fh.x - fl.x));
+
+    float4 o = float4(0);
+    float shellA = inShell * (dark ? 0.15 : 0.13);
+    shellA += inShell * (1 - smoothstep(0.0, 1.1, -shell)) * (dark ? 0.28 : 0.24);
+    o = over(float4(col * shellA, shellA), o);
+    float nubA = (1 - smoothstep(-aa, aa, nub)) * (dark ? 0.40 : 0.36);
+    o = over(float4(col * nubA, nubA), o);
+
+    float front = exp(-max(fh.x - p.x, 0.0) / 9.0);
+    float fa = inFill * (mix(0.56, 0.78, t) + 0.12 * front);
+    float3 fc = mix(col * (dark ? 0.86 : 1.0), dark ? mix(col, float3(1), 0.12) : col, t);
+    o = over(float4(fc * fa, fa), o);
+
+    float glow = (1 - inShell) * exp(-max(fd, 0.0) / 6.0) * (dark ? 0.16 : 0.0) * 0.6;
+    o = over(o, float4(col * glow, glow));
+    return o;
+}
 """
 
-struct FlowUniforms {
-    var size = SIMD2<Float>(0, 0), scale: Float = 2, dark: Float = 1
-    var main: Float = 0, charge: Float = 0, drain: Float = 0, pad: Float = 0
-    var pMain: Float = 0, pCharge: Float = 0, pDrain: Float = 0, calm: Float = 0
-    var charger = SIMD4<Float>(repeating: 0), mac = SIMD4<Float>(repeating: 0), cell = SIMD4<Float>(repeating: 0)
-    var violet = SIMD4<Float>(repeating: 0), teal = SIMD4<Float>(repeating: 0), gold = SIMD4<Float>(repeating: 0)
+private func rgb(_ h: UInt32) -> SIMD4<Float> { SIMD4(Float(h >> 16 & 255) / 255, Float(h >> 8 & 255) / 255, Float(h & 255) / 255, 1) }
+/// Keeps stream positions small enough for float precision over long sessions.
+private func wrap(_ x: Double) -> Float { Float(x.truncatingRemainder(dividingBy: 248_640)) }
+
+private enum GPU {
+    static let device = MTLCreateSystemDefaultDevice()
+    static let queue = device?.makeCommandQueue()
+    static let library: MTLLibrary? = {
+        do { return try device?.makeLibrary(source: shaderSource, options: nil) }
+        catch { NSLog("Joule shaders: \(error)"); return nil }
+    }()
+    static func pipeline(_ fragment: String) -> MTLRenderPipelineState? {
+        guard let device, let library else { return nil }
+        let d = MTLRenderPipelineDescriptor()
+        d.vertexFunction = library.makeFunction(name: "vs")
+        d.fragmentFunction = library.makeFunction(name: fragment)
+        d.colorAttachments[0].pixelFormat = .bgra8Unorm
+        do { return try device.makeRenderPipelineState(descriptor: d) }
+        catch { NSLog("Joule pipeline \(fragment): \(error)"); return nil }
+    }
 }
 
-/// Eases ribbon widths toward the latest reading, and advances each stream's position by
-/// integrating its speed, so a change in power never makes the light skip.
-final class FlowRenderer: NSObject, MTKViewDelegate {
-    static let shared = FlowRenderer()
-    let device = MTLCreateSystemDefaultDevice()
-    private lazy var queue = device?.makeCommandQueue()
-    private lazy var pipeline: MTLRenderPipelineState? = {
-        guard let device else { return nil }
-        do {
-            let lib = try device.makeLibrary(source: shaderSource, options: nil)
-            let d = MTLRenderPipelineDescriptor()
-            d.vertexFunction = lib.makeFunction(name: "vs")
-            d.fragmentFunction = lib.makeFunction(name: "fs")
-            d.colorAttachments[0].pixelFormat = .bgra8Unorm
-            return try device.makeRenderPipelineState(descriptor: d)
-        } catch { NSLog("Joule flow shader: \(error)"); return nil }
-    }()
-    var reading = Reading()
+/// One full-view shader. Subclasses ease their own state and supply the uniforms.
+class StageRenderer: NSObject, MTKViewDelegate {
     var dark = true
     var calm = false
     private(set) var frames = 0
-    private var main = 0.0, charge = 0.0, drain = 0.0, span = 40.0
-    private var phases = SIMD3<Double>(40, 90, 140)
+    private let fragment: String
+    private lazy var pipeline = GPU.pipeline(fragment)
     private var last: CFTimeInterval?
+    init(_ fragment: String) { self.fragment = fragment }
 
-    private func rgb(_ h: UInt32) -> SIMD4<Float> { SIMD4(Float(h >> 16 & 255) / 255, Float(h >> 8 & 255) / 255, Float(h & 255) / 255, 1) }
+    func advance(_ dt: Double?) {}
+    func bind(_ e: MTLRenderCommandEncoder, _ size: CGSize, _ scale: CGFloat) {}
 
-    func advance(_ dt: Double?) {
-        let r = reading, out = max(0, -r.battery)
-        let goal = (min(r.input, r.system), max(0, r.battery), out, max(40, r.adapterWatts, r.input + out))
-        let k = dt.map { 1 - exp(-min($0, 1) / 0.8) } ?? 1
-        main += (goal.0 - main) * k
-        charge += (goal.1 - charge) * k
-        drain += (goal.2 - drain) * k
-        span += (goal.3 - span) * k
-        let d = min(dt ?? 0, 0.1)
-        func speed(_ w: Double) -> Double { 34 + min(60, w) * 0.9 }
-        phases += SIMD3(speed(main), speed(charge), speed(drain)) * d
-    }
-    private func uniforms(_ size: CGSize, _ scale: CGFloat) -> FlowUniforms {
-        var u = FlowUniforms()
-        u.size = SIMD2(Float(size.width), Float(size.height)); u.scale = Float(scale); u.dark = dark ? 1 : 0
-        let px = 54 / span
-        u.main = Float(main * px); u.charge = Float(charge * px); u.drain = Float(drain * px)
-        // Keep numbers small enough for float precision over long sessions.
-        func wrap(_ x: Double) -> Float { Float(x.truncatingRemainder(dividingBy: 248_640)) }
-        u.pMain = wrap(phases.x); u.pCharge = wrap(phases.y); u.pDrain = wrap(phases.z); u.calm = calm ? 1 : 0
-        u.charger = rgb(dark ? 0x3987E5 : 0x2A78D6); u.mac = rgb(dark ? 0xD95926 : 0xEB6834); u.cell = rgb(dark ? 0x199E70 : 0x1BAF7A)
-        // Hand-picked midpoints: blending straight between the node colours turns grey.
-        u.violet = rgb(dark ? 0x9A68C9 : 0x9A5CC0); u.teal = rgb(dark ? 0x22A0B8 : 0x1F9FB5); u.gold = rgb(dark ? 0xB59A2C : 0xC7A32E)
-        return u
-    }
     private func encode(_ pass: MTLRenderPassDescriptor, _ size: CGSize, _ scale: CGFloat) -> MTLCommandBuffer? {
-        guard let pipeline, let cb = queue?.makeCommandBuffer(), let e = cb.makeRenderCommandEncoder(descriptor: pass) else { return nil }
-        var u = uniforms(size, scale)
+        guard let pipeline, let cb = GPU.queue?.makeCommandBuffer(), let e = cb.makeRenderCommandEncoder(descriptor: pass) else { return nil }
         e.setRenderPipelineState(pipeline)
-        e.setFragmentBytes(&u, length: MemoryLayout<FlowUniforms>.stride, index: 0)
+        bind(e, size, scale)
         e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         e.endEncoding()
         return cb
     }
-
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
     func draw(in view: MTKView) {
         let now = CACurrentMediaTime()
@@ -197,10 +217,9 @@ final class FlowRenderer: NSObject, MTKViewDelegate {
         cb.present(d); cb.commit()
         frames += 1
     }
-
     /// Off-screen frame, for snapshots.
     func image(_ size: CGSize, scale: CGFloat = 2) -> CGImage? {
-        guard let device else { return nil }
+        guard let device = GPU.device else { return nil }
         let w = Int(size.width * scale), h = Int(size.height * scale)
         let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
         td.usage = [.renderTarget]; td.storageMode = .shared
@@ -219,32 +238,117 @@ final class FlowRenderer: NSObject, MTKViewDelegate {
     }
 }
 
-struct FlowSurface: NSViewRepresentable {
-    var reading: Reading
-    var running: Bool
-    var dark: Bool
-    var calm: Bool
+private struct FlowUniforms {
+    var size = SIMD2<Float>(0, 0), scale: Float = 2, dark: Float = 1
+    var main: Float = 0, charge: Float = 0, drain: Float = 0, pad: Float = 0
+    var pMain: Float = 0, pCharge: Float = 0, pDrain: Float = 0, calm: Float = 0
+    var charger = SIMD4<Float>(repeating: 0), mac = SIMD4<Float>(repeating: 0), cell = SIMD4<Float>(repeating: 0)
+    var violet = SIMD4<Float>(repeating: 0), teal = SIMD4<Float>(repeating: 0), gold = SIMD4<Float>(repeating: 0)
+}
 
-    final class Surface: MTKView {
-        override var isOpaque: Bool { false }
-        override func hitTest(_ p: NSPoint) -> NSView? { nil }
+/// Eases ribbon widths toward the latest reading, and advances each stream's position by
+/// integrating its speed, so a change in power never makes the light skip.
+final class FlowRenderer: StageRenderer {
+    static let shared = FlowRenderer()
+    var reading = Reading()
+    private var main = 0.0, charge = 0.0, drain = 0.0, span = 40.0
+    private var phases = SIMD3<Double>(40, 90, 140)
+    init() { super.init("fs") }
+
+    override func advance(_ dt: Double?) {
+        let r = reading, out = max(0, -r.battery)
+        let goal = (min(r.input, r.system), max(0, r.battery), out, max(40, r.adapterWatts, r.input + out))
+        let k = dt.map { 1 - exp(-min($0, 1) / 0.8) } ?? 1
+        main += (goal.0 - main) * k
+        charge += (goal.1 - charge) * k
+        drain += (goal.2 - drain) * k
+        span += (goal.3 - span) * k
+        let d = min(dt ?? 0, 0.1)
+        func speed(_ w: Double) -> Double { 34 + min(60, w) * 0.9 }
+        phases += SIMD3(speed(main), speed(charge), speed(drain)) * d
     }
-    func makeNSView(context: Context) -> Surface {
-        let v = Surface(frame: .zero, device: FlowRenderer.shared.device)
-        v.colorPixelFormat = .bgra8Unorm
-        v.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-        v.layer?.isOpaque = false
-        (v.layer as? CAMetalLayer)?.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
-        v.preferredFramesPerSecond = 60
-        v.delegate = FlowRenderer.shared
-        return v
+    override func bind(_ e: MTLRenderCommandEncoder, _ size: CGSize, _ scale: CGFloat) {
+        var u = FlowUniforms()
+        u.size = SIMD2(Float(size.width), Float(size.height)); u.scale = Float(scale); u.dark = dark ? 1 : 0
+        let px = 54 / span
+        u.main = Float(main * px); u.charge = Float(charge * px); u.drain = Float(drain * px)
+        u.pMain = wrap(phases.x); u.pCharge = wrap(phases.y); u.pDrain = wrap(phases.z); u.calm = calm ? 1 : 0
+        u.charger = rgb(dark ? 0x3987E5 : 0x2A78D6); u.mac = rgb(dark ? 0xD95926 : 0xEB6834); u.cell = rgb(dark ? 0x199E70 : 0x1BAF7A)
+        // Hand-picked midpoints: blending straight between the node colours turns grey.
+        u.violet = rgb(dark ? 0x9A68C9 : 0x9A5CC0); u.teal = rgb(dark ? 0x22A0B8 : 0x1F9FB5); u.gold = rgb(dark ? 0xB59A2C : 0xC7A32E)
+        e.setFragmentBytes(&u, length: MemoryLayout<FlowUniforms>.stride, index: 0)
     }
-    func updateNSView(_ v: Surface, context: Context) {
-        let r = FlowRenderer.shared
-        r.reading = reading; r.dark = dark; r.calm = calm
-        // With Reduce Motion on, redraw once per reading instead of animating.
-        v.enableSetNeedsDisplay = calm
-        v.isPaused = calm || !running
-        if calm { v.needsDisplay = true }
+}
+
+private struct GaugeUniforms {
+    var size = SIMD2<Float>(0, 0), scale: Float = 2, dark: Float = 1
+    var level: Float = 0, pad0: Float = 0, pad1: Float = 0, pad2: Float = 0
+    var color = SIMD4<Float>(repeating: 0)
+}
+
+final class GaugeRenderer: StageRenderer {
+    static let shared = GaugeRenderer()
+    var percent = 0.0, critical = false
+    init() { super.init("gauge") }
+
+    override func bind(_ e: MTLRenderCommandEncoder, _ size: CGSize, _ scale: CGFloat) {
+        var u = GaugeUniforms()
+        u.size = SIMD2(Float(size.width), Float(size.height)); u.scale = Float(scale); u.dark = dark ? 1 : 0
+        u.level = Float(percent / 100)
+        u.color = critical ? rgb(dark ? 0xE66767 : 0xD03B3B) : rgb(dark ? 0x199E70 : 0x1BAF7A)
+        e.setFragmentBytes(&u, length: MemoryLayout<GaugeUniforms>.stride, index: 0)
+    }
+}
+
+/// Hosts a renderer on screen. Snapshots get a still frame instead, since they can't see Metal layers.
+struct Stage: View {
+    let renderer: StageRenderer
+    var size: CGSize
+    var running: Bool
+    /// When false, draws only when its data changes.
+    var animated = true
+    var update: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var still
+    @Environment(\.colorScheme) private var scheme
+    static var snapshot = false
+
+    var body: some View {
+        Group {
+            if Stage.snapshot, let i = frame() { Image(decorative: i, scale: 2) }
+            else { Surface(stage: self, dark: scheme == .dark, calm: still || !animated) }
+        }
+        .frame(width: size.width, height: size.height)
+        .accessibilityHidden(true)
+    }
+    private func frame() -> CGImage? {
+        renderer.dark = scheme == .dark
+        update(); renderer.advance(1); renderer.advance(0.1)
+        return renderer.image(size)
+    }
+
+    private struct Surface: NSViewRepresentable {
+        var stage: Stage, dark: Bool, calm: Bool
+        final class Clear: MTKView {
+            override var isOpaque: Bool { false }
+            override func hitTest(_ p: NSPoint) -> NSView? { nil }
+        }
+        func makeNSView(context: Context) -> Clear {
+            let v = Clear(frame: .zero, device: GPU.device)
+            v.colorPixelFormat = .bgra8Unorm
+            v.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+            v.layer?.isOpaque = false
+            (v.layer as? CAMetalLayer)?.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+            v.preferredFramesPerSecond = 60
+            v.delegate = stage.renderer
+            return v
+        }
+        func updateNSView(_ v: Clear, context: Context) {
+            stage.renderer.dark = dark; stage.renderer.calm = calm
+            stage.update()
+            // With Reduce Motion on, redraw once per reading instead of animating.
+            v.enableSetNeedsDisplay = calm
+            v.isPaused = calm || !stage.running
+            if calm { v.needsDisplay = true }
+        }
     }
 }

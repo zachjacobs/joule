@@ -3,6 +3,7 @@ import SwiftUI
 
 final class Delegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let model = Model()
+    let notifier = Notifier()
     var item: NSStatusItem!
     let pop = NSPopover()
     var window: NSWindow?
@@ -11,6 +12,7 @@ final class Delegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--snapshot"), args.count > i + 1 { return snapshot(args[i + 1], dark: !args.contains("--light")) }
+        if args.contains("--selftest") { exit(Demo.selfTest() ? 0 : 1) }
         if let i = args.firstIndex(of: "--frames"), args.count > i + 1 { return frames(args[i + 1]) }
         if let i = args.firstIndex(of: "--icon"), args.count > i + 1 { return icon(args[i + 1]) }
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -20,10 +22,15 @@ final class Delegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         item.button?.imagePosition = .imageLeading
         pop.behavior = .transient
         pop.delegate = self
-        let host = NSHostingController(rootView: Panel(m: model))
+        let host = NSHostingController(rootView: Panel(m: model, notifier: notifier))
         host.sizingOptions = .preferredContentSize
         pop.contentViewController = host
         model.onUpdate = { [weak self] in self?.refresh() }
+        if args.contains("--ephemeral") { model.ephemeral = true }
+        else {
+            notifier.start()
+            model.onNotes = { [notifier] in $0.forEach(notifier.post) }
+        }
         refresh()
         if args.contains("--open") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.toggle() } }
     }
@@ -67,6 +74,7 @@ final class Delegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let b = item.button else { return }
         if pop.isShown { pop.performClose(nil); return }
         model.visible = true
+        if !model.ephemeral { notifier.recheck() }
         NSApp.activate(ignoringOtherApps: true)
         // Settle the size first; growing after opening would push the panel off screen.
         if let v = pop.contentViewController?.view { v.layoutSubtreeIfNeeded(); pop.contentSize = v.fittingSize }
@@ -131,6 +139,10 @@ final class Delegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// Development aid: render the live panel to a PNG and exit.
     private func snapshot(_ path: String, dark: Bool) {
+        model.ephemeral = true
+        if CommandLine.arguments.contains("--demo-history") { model.history = Demo.history() }
+        if CommandLine.arguments.contains("--24h") { HistoryUI.start.hours = 24 }
+        if CommandLine.arguments.contains("--level") { HistoryUI.start.level = true }
         if CommandLine.arguments.contains("--demo-battery") {
             model.adjust = { r in r.plugged = false; r.charging = false; r.input = 0; r.wall = 0; r.battery = -r.system; r.percent = 64; r.remaining = r.fullCap * 0.64 }
         }
@@ -140,12 +152,8 @@ final class Delegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if CommandLine.arguments.contains("--demo-drain") {
             model.adjust = { r in r.input = 25.8; r.system = 37.6; r.battery = -11.8; r.display = 7; r.processor = 18 }
         }
-        Flow.frame = { [model] size, dark in
-            let f = FlowRenderer.shared
-            f.reading = model.smooth; f.dark = dark; f.advance(1); f.advance(0.1)
-            return f.image(size)
-        }
-        let root = Panel(m: model).background(Color(nsColor: .windowBackgroundColor))
+        Stage.snapshot = true
+        let root = Panel(m: model, notifier: notifier).background(Color(nsColor: .windowBackgroundColor))
         let v = NSHostingView(rootView: root)
         v.frame = NSRect(origin: .zero, size: v.fittingSize)
         let w = NSWindow(contentRect: v.frame, styleMask: [.borderless], backing: .buffered, defer: false)
@@ -160,7 +168,6 @@ final class Delegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             v.cacheDisplay(in: v.bounds, to: rep)
             try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
             print(v.bounds.size, self.model.now)
-            self.model.flush()
             exit(0)
         }
     }
